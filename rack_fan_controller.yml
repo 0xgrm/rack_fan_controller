@@ -170,6 +170,10 @@ script:
           // Retained for next calculation
           static float last_temp_mean = 0;
 
+          // Last top temperature
+          // Retained for next calculation
+          static float last_temp_top = 0;
+
           // Current differece of temperature between the top and the base of the rack
           float current_temp_delta = id(temp_top_rack).state - id(temp_base_rack).state;
 
@@ -177,7 +181,7 @@ script:
           float current_temp_mean = ( id(temp_base_rack).state + id(temp_top_rack).state ) / 2;
 
           // Top temperature of the rack
-          float temp_top = id(temp_top_rack).state;
+          float current_temp_top = id(temp_top_rack).state;
 
           // Fan speed output level, retained for next calculation
           static esphome::fan::FanSpeed fan_speed_output = FAN_SPEED_MEDIUM;
@@ -198,8 +202,16 @@ script:
             mean_ub += margin;
           }
 
+          // Set lower and upper bounds for last_temp_top
+          float top_lb = last_temp_top;
+          float top_ub = last_temp_top;
+          if ( last_temp_top > 0 ) {
+            top_lb -= margin;
+            top_ub += margin;
+          }
+
           if ( current_temp_mean >= temp_mean_ranges[num_temp_ranges - 1]
-              || temp_top >= 27
+              || ( ( current_temp_top < top_lb || current_temp_top > top_ub ) && current_temp_top >= 27 )
               || current_temp_delta > temp_delta_ranges[num_temp_ranges - 1] ) {
             fan_speed_output = FAN_SPEED_HIGH;
           } else if ( current_temp_mean < temp_mean_ranges[0] ) {
