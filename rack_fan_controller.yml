@@ -3,13 +3,15 @@ esphome:
   platform: esp32
   board: lolin32
 
+# Enable Wifi
 wifi:
   ssid: !secret wifi_ssid
   password: !secret wifi_password
 
+# Enable MQTT
 mqtt:
   broker: !secret mqtt_broker
-  client_id: 'rack-fan-control'
+  client_id: 'rack_fan_controller'
   discovery: false
   reboot_timeout: 10s
 
@@ -23,6 +25,10 @@ dallas:
   - pin: GPIO18
     update_interval: 5s
 
+# Hardware PWM output for controlling fan speed
+# Frequency is fixed at 25 KHz, per Intel specifications
+# All fans are controlled by a single PWM signal
+# If you want to control each fan independantly, just add corresponding outputs
 output:
   - platform: ledc
     pin: GPIO13
@@ -30,6 +36,7 @@ output:
     id: fan_output
     
 sensor:
+# Dallas temperature sensors declaration
   - platform: dallas
     address: 0xF48000001EA0AF28
     name: "Temperature Base Rack"
@@ -41,15 +48,12 @@ sensor:
     name: "Temperature Top Rack"
     id: temp_top_rack
     accuracy_decimals: 1
-    # on_value:
-    #   then:
-    #     - fan.turn_on:
-    #         id: fan_speed
-    #         speed: MEDIUM
     on_value:
       then:
         - script.execute: fan_regulation
 
+# Tachometers declaration for each fan
+# Useful to detect malfunctioning fans
   - platform: pulse_counter
     pin: GPIO12
     name: "Front Left Fan Tachometer"
@@ -128,6 +132,7 @@ sensor:
       - multiply: 0.5
     update_interval: 10s
 
+# Fan declaration with speed values
 fan:
   - platform: speed
     output: fan_output
@@ -145,95 +150,88 @@ script:
           // Set the hysteresis margin
           const float margin = 0.25;
 
-          // Set the number of output levels
-          const int num_speed_levels = 3;
+          // Set the number of fan speed levels
+          const int num_fan_speed_levels = 3;
 
-          // Set the values of output levels
-          const esphome::fan::FanSpeed fan_speed_levels[num_speed_levels] = { FAN_SPEED_LOW,
-                                                                              FAN_SPEED_MEDIUM,
-                                                                              FAN_SPEED_HIGH };
+          // Set the values of fan speed levels
+          const esphome::fan::FanSpeed fan_speed_levels[num_fan_speed_levels] = { FAN_SPEED_LOW,
+                                                                                  FAN_SPEED_MEDIUM,
+                                                                                  FAN_SPEED_HIGH };
 
-          // Set the number of temperature ranges
-          const int num_temp_ranges = 3;
+          // Fan speed output level; retained for next calculation
+          static esphome::fan::FanSpeed fan_speed_output = FAN_SPEED_MEDIUM;
 
-          // Set the values of temperature delta ranges
-          const float temp_delta_ranges[num_temp_ranges] = { 0, 2, 3.5 };
+          // Set the number of mean temperature ranges
+          const int num_temp_mean_ranges = 3;
 
           // Set the values of mean temperature ranges
-          const float temp_mean_ranges[num_temp_ranges] = { 20, 22, 26 };
+          const float temp_mean_ranges[num_temp_mean_ranges] = { 0, 22, 26 };
 
-          // Last difference of temperature between the top and the base of the rack
-          // Retained for next calculation
-          static float last_temp_delta = 0;
+          // Last mean temperature range; retained for next calculation
+          static int last_temp_mean = 0;
 
-          // Last mean temperature
-          // Retained for next calculation
-          static float last_temp_mean = 0;
-
-          // Last top temperature
-          // Retained for next calculation
-          static float last_temp_top = 0;
-
-          // Current differece of temperature between the top and the base of the rack
-          float current_temp_delta = id(temp_top_rack).state - id(temp_base_rack).state;
-
-          // Mean temperature of the rack
+          // Current mean temperature of the rack
           float current_temp_mean = ( id(temp_base_rack).state + id(temp_top_rack).state ) / 2;
 
-          // Top temperature of the rack
+          // Current top temperature of the rack
           float current_temp_top = id(temp_top_rack).state;
 
-          // Fan speed output level, retained for next calculation
-          static esphome::fan::FanSpeed fan_speed_output = FAN_SPEED_MEDIUM;
-          
-          // Set lower and upper bounds for last_temp_delta
-          float delta_lb = last_temp_delta;
-          float delta_ub = last_temp_delta;
-          if ( last_temp_delta >= margin ) {
-            delta_lb -= margin;
-            delta_ub += margin;
-          }
-
-          // Set lower and upper bounds for last_temp_min
-          float mean_lb = last_temp_mean;
-          float mean_ub = last_temp_mean;
+          // Set lower and upper bounds for last mean temperature range
+          float mean_lb = temp_mean_ranges[last_temp_mean];
+          float mean_ub = 0;
           if ( last_temp_mean > 0 ) {
             mean_lb -= margin;
-            mean_ub += margin;
+          }
+          if ( last_temp_mean + 1 > num_temp_mean_ranges - 1 ) {
+            mean_ub = temp_mean_ranges[num_temp_mean_ranges - 1] + margin;
+          } else {
+            mean_ub = temp_mean_ranges[last_temp_mean + 1] + margin;
           }
 
-          // Set lower and upper bounds for last_temp_top
-          float top_lb = last_temp_top;
-          float top_ub = last_temp_top;
-          if ( last_temp_top > 0 ) {
-            top_lb -= margin;
-            top_ub += margin;
-          }
+          // Set lower bound for high temperature limit
+          float top_lb = 27 - margin;
 
-          if ( current_temp_mean >= temp_mean_ranges[num_temp_ranges - 1]
-              || ( ( current_temp_top < top_lb || current_temp_top > top_ub ) && current_temp_top >= 27 )
-              || current_temp_delta > temp_delta_ranges[num_temp_ranges - 1] ) {
-            fan_speed_output = FAN_SPEED_HIGH;
-          } else if ( current_temp_mean < temp_mean_ranges[0] ) {
-            fan_speed_output = FAN_SPEED_LOW;
-          } else if ( current_temp_mean < mean_lb || current_temp_mean > delta_ub ) {
-            int i;
-            for ( i = 0; i < num_temp_ranges; i++ ) {
-              if ( current_temp_mean >= temp_mean_ranges[i] && current_temp_mean < temp_mean_ranges[i + 1] ) {
-                break;
+          // Boolean to help with high temperature mode
+          // High temperature mode is triggered when top temperature is > 27 °C, independently of
+          // mean temperature value
+          static bool temp_is_high = false;
+
+          // Start of regulation code
+          //
+          // First detect if we are in high temperature mode
+          // Then quit this mode if top temperature is < to lower bound
+          //
+          // If we're not in high temperature mode, trigger it if top temperature is > 27 °C
+          //
+          // If top temperature is < 27 °C, regulate fan speed with mean temperature :
+          //
+          // < 22 °C    ==> FAN_SPEED_LOW
+          // 22 - 22 °C ==> FAN_SPEED_MEDIUM
+          // > 26 °C    ==> FAN_SPEED_HIGH
+          if ( temp_is_high ) {
+            if ( current_temp_top < top_lb ) {
+            temp_is_high = false;
+            }
+          } else {
+            if ( current_temp_top >= 27 ) {
+              temp_is_high = true;
+              fan_speed_output = FAN_SPEED_HIGH;
+            }
+            if ( current_temp_mean < mean_lb || current_temp_mean > mean_ub ) {
+              if ( current_temp_mean > temp_mean_ranges[num_temp_mean_ranges - 1] ) {
+                fan_speed_output = FAN_SPEED_HIGH;
+              } else {
+                int i;
+                for ( i = 0; i < num_temp_mean_ranges; i++ ) {
+                  if ( current_temp_mean >= temp_mean_ranges[i] && current_temp_mean < temp_mean_ranges[i + 1] ) {
+                    break;
+                  }
+                }
+                last_temp_mean = temp_mean_ranges[i];
+                fan_speed_output = fan_speed_levels[i];
               }
             }
-            fan_speed_output = FAN_SPEED_MEDIUM;
-          } else if ( current_temp_delta < delta_lb || current_temp_delta > delta_ub ) {
-            int i;
-            for ( i = 0 ; i < num_temp_ranges ; i++ ) {
-              if ( current_temp_delta >= temp_delta_ranges[i] && current_temp_delta < temp_delta_ranges[i + 1] ) {
-                break;
-              }
-            }
-            fan_speed_output = fan_speed_levels[i];
-            last_temp_delta = current_temp_delta;
           }
 
-          // Set fans speed
+          // Set fan speed
           id(fan_speed).turn_on().set_speed(fan_speed_output).perform();
