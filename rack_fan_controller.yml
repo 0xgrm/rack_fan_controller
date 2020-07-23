@@ -1,0 +1,227 @@
+esphome:
+  name: rack_fan_controller
+  platform: esp32
+  board: lolin32
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+mqtt:
+  broker: '10.8.1.20'
+  client_id: 'rack-fan-control'
+  discovery: false
+  reboot_timeout: 10s
+
+# Enable logging
+logger:
+
+# Enable OTA
+ota:
+
+dallas:
+  - pin: GPIO18
+    update_interval: 5s
+
+output:
+  - platform: ledc
+    pin: GPIO13
+    frequency: 25000 Hz
+    id: fan_output
+    
+sensor:
+  - platform: dallas
+    address: 0xF48000001EA0AF28
+    name: "Temperature Base Rack"
+    id: temp_base_rack
+    accuracy_decimals: 1
+
+  - platform: dallas
+    address: 0x408000001E87D828
+    name: "Temperature Top Rack"
+    id: temp_top_rack
+    accuracy_decimals: 1
+    # on_value:
+    #   then:
+    #     - fan.turn_on:
+    #         id: fan_speed
+    #         speed: MEDIUM
+    on_value:
+      then:
+        - script.execute: fan_regulation
+
+  - platform: pulse_counter
+    pin: GPIO12
+    name: "Front Left Fan Tachometer"
+    id: fan_fl_tacho
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    unit_of_measurement: "tr/min"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+  - platform: pulse_counter
+    pin: GPIO14
+    name: "Front Middle Fan Tachometer"
+    id: fan_fm_tacho
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    unit_of_measurement: "tr/min"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+  - platform: pulse_counter
+    pin: GPIO27
+    name: "Front Right Fan Tachometer"
+    id: fan_fr_tacho
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    unit_of_measurement: "tr/min"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+  - platform: pulse_counter
+    pin: GPIO26
+    name: "Rear Left Fan Tachometer"
+    id: fan_rl_tacho
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    unit_of_measurement: "tr/min"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+  - platform: pulse_counter
+    pin: GPIO25
+    name: "Rear Middle Fan Tachometer"
+    id: fan_rm_tacho
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    unit_of_measurement: "tr/min"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+  - platform: pulse_counter
+    pin: GPIO33
+    name: "Rear Right Fan Tachometer"
+    id: fan_rr_tacho
+    count_mode:
+      rising_edge: DISABLE
+      falling_edge: INCREMENT
+    unit_of_measurement: "tr/min"
+    accuracy_decimals: 0
+    filters:
+      - multiply: 0.5
+    update_interval: 10s
+
+fan:
+  - platform: speed
+    output: fan_output
+    name: "Ventilation rack"
+    id: fan_speed
+    speed:
+      low: 0.35
+      medium: 0.5
+      high: 1
+
+script:
+  - id: fan_regulation
+    then:
+      - lambda: |-
+          // Set the hysteresis margin
+          const float margin = 0.25;
+
+          // Set the number of output levels
+          const int num_speed_levels = 3;
+
+          // Set the values of output levels
+          const esphome::fan::FanSpeed fan_speed_levels[num_speed_levels] = { FAN_SPEED_LOW,
+                                                                              FAN_SPEED_MEDIUM,
+                                                                              FAN_SPEED_HIGH };
+
+          // Set the number of temperature ranges
+          const int num_temp_ranges = 3;
+
+          // Set the values of temperature delta ranges
+          const float temp_delta_ranges[num_temp_ranges] = { 0, 2, 3.5 };
+
+          // Set the values of mean temperature ranges
+          const float temp_mean_ranges[num_temp_ranges] = { 20, 22, 26 };
+
+          // Last difference of temperature between the top and the base of the rack
+          // Retained for next calculation
+          static float last_temp_delta = 0;
+
+          // Last mean temperature
+          // Retained for next calculation
+          static float last_temp_mean = 0;
+
+          // Current differece of temperature between the top and the base of the rack
+          float current_temp_delta = id(temp_top_rack).state - id(temp_base_rack).state;
+
+          // Mean temperature of the rack
+          float current_temp_mean = ( id(temp_base_rack).state + id(temp_top_rack).state ) / 2;
+
+          // Top temperature of the rack
+          float temp_top = id(temp_top_rack).state;
+
+          // Fan speed output level, retained for next calculation
+          static esphome::fan::FanSpeed fan_speed_output = FAN_SPEED_MEDIUM;
+          
+          // Set lower and upper bounds for last_temp_delta
+          float delta_lb = last_temp_delta;
+          float delta_ub = last_temp_delta;
+          if ( last_temp_delta >= margin ) {
+            delta_lb -= margin;
+            delta_ub += margin;
+          }
+
+          // Set lower and upper bounds for last_temp_min
+          float mean_lb = last_temp_mean;
+          float mean_ub = last_temp_mean;
+          if ( last_temp_mean > 0 ) {
+            mean_lb -= margin;
+            mean_ub += margin;
+          }
+
+          if ( current_temp_mean >= temp_mean_ranges[num_temp_ranges - 1]
+              || temp_top >= 27
+              || current_temp_delta > temp_delta_ranges[num_temp_ranges - 1] ) {
+            fan_speed_output = FAN_SPEED_HIGH;
+          } else if ( current_temp_mean < temp_mean_ranges[0] ) {
+            fan_speed_output = FAN_SPEED_LOW;
+          } else if ( current_temp_mean < mean_lb || current_temp_mean > delta_ub ) {
+            int i;
+            for ( i = 0; i < num_temp_ranges; i++ ) {
+              if ( current_temp_mean >= temp_mean_ranges[i] && current_temp_mean < temp_mean_ranges[i + 1] ) {
+                break;
+              }
+            }
+            fan_speed_output = FAN_SPEED_MEDIUM;
+          } else if ( current_temp_delta < delta_lb || current_temp_delta > delta_ub ) {
+            int i;
+            for ( i = 0 ; i < num_temp_ranges ; i++ ) {
+              if ( current_temp_delta >= temp_delta_ranges[i] && current_temp_delta < temp_delta_ranges[i + 1] ) {
+                break;
+              }
+            }
+            fan_speed_output = fan_speed_levels[i];
+            last_temp_delta = current_temp_delta;
+          }
+
+          // Set fans speed
+          id(fan_speed).turn_on().set_speed(fan_speed_output).perform();
